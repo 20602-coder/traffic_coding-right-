@@ -11,32 +11,39 @@ st.set_page_config(
     layout="wide"
 )
 
-# 모델 로드 (캐싱 적용으로 슬라이더 조작 시 빠른 반응 속도 유지)
+# 모델 로드 (캐싱 적용)
 @st.cache_resource
 def load_orange_model(model_path: str):
     with open(model_path, "rb") as f:
         model = pickle.load(f)
     return model
 
-# 데이터프레임을 Orange3 Table로 변환하여 예측하는 함수
+# 예측 함수 (원본 도메인 및 전처리 파이프라인 자동 호환)
 def predict_fatalities(model, sido: str, accident_cnt: float, minor_injury_cnt: float) -> float:
-    domain = model.domain
-    attributes = domain.attributes
+    # 1. 원본 입력 피처 도메인 가져오기 (원핫 인코딩 전 원본 구조)
+    base_domain = getattr(model, "original_domain", None)
+    if base_domain is None and getattr(model, "instances", None) is not None:
+        base_domain = model.instances.domain
+    if base_domain is None:
+        base_domain = model.domain
 
-    # 학습 데이터의 기본값(평균/최빈값) 추출 (슬라이더 외 변수가 있을 경우 대비)
+    orig_attrs = base_domain.attributes
+
+    # 2. 학습 데이터(instances)에서 기본값(평균/최빈값) 추출
     default_values = {}
     if getattr(model, "instances", None) is not None and len(model.instances) > 0:
-        df_orig = pd.DataFrame(model.instances.X, columns=[attr.name for attr in attributes])
-        for attr in attributes:
+        inst_attrs = model.instances.domain.attributes
+        df_orig = pd.DataFrame(model.instances.X, columns=[attr.name for attr in inst_attrs])
+        for attr in inst_attrs:
             if attr.is_continuous:
                 default_values[attr.name] = float(df_orig[attr.name].mean())
             elif attr.is_discrete:
                 mode_idx = int(df_orig[attr.name].mode()[0])
                 default_values[attr.name] = attr.values[mode_idx]
 
-    # 현재 사용자 입력값을 모델 도메인 순서에 맞게 구성
+    # 3. 사용자 입력값을 원본 피처 순서에 맞게 매핑
     row = []
-    for attr in attributes:
+    for attr in orig_attrs:
         name = attr.name
         if "시도" in name:
             row.append(sido)
@@ -45,17 +52,16 @@ def predict_fatalities(model, sido: str, accident_cnt: float, minor_injury_cnt: 
         elif "경상" in name:
             row.append(float(minor_injury_cnt))
         else:
-            # 중상자수, 부상신고자수 등 추가 피처가 있는 경우 평균값 또는 0으로 채움
+            # 중상자수, 부상신고자수 등 나머지 변수는 학습 데이터 평균값 사용
             fallback = 0.0 if attr.is_continuous else attr.values[0]
             row.append(default_values.get(name, fallback))
 
-    # Orange3 예측용 Domain (타겟 변수 제외한 입력 피처만 포함)
-    input_domain = Domain(attributes)
+    # 4. 입력용 Table 생성 후 모델 예측 실행 (Orange3가 내부적으로 원핫 인코딩/정규화 자동 처리)
+    input_domain = Domain(orig_attrs)
     input_table = Table.from_list(input_domain, [row])
 
-    # 예측 실행
     pred = model(input_table)[0]
-    return max(0.0, float(pred))  # 사망자 수가 음수로 예측될 경우 0으로 보정
+    return max(0.0, float(pred))
 
 
 # --- UI 구성 ---
@@ -63,25 +69,28 @@ st.title("🚦 교통사고 피해 예측 및 어린이 보호구역 안전 신�
 st.markdown("시도별 사고건수와 경상자수를 조절하여 **예상 사망자 수**와 **위험 단계**를 실시간으로 확인하세요.")
 st.divider()
 
-# 모델 불러오기
 MODEL_FILE = "traffic_casualty_model.pkcls"
 try:
     model = load_orange_model(MODEL_FILE)
 except FileNotFoundError:
-    st.error(f"❌ `{MODEL_FILE}` 파일을 찾을 수 없습니다. `app.py`와 같은 폴더에 모델 파일을 업로드해주세요.")
+    st.error(f"❌ `{MODEL_FILE}` 파일을 찾을 수 없습니다. `app.py`와 같은 폴더에 업로드해주세요.")
     st.stop()
 except Exception as e:
     st.error(f"❌ 모델을 불러오는 중 오류가 발생했습니다: {e}")
     st.stop()
 
-# 모델 도메인에서 시도 목록 추출
+# 원본 도메인에서 시도 목록 추출
+base_domain = getattr(model, "original_domain", None) or (
+    model.instances.domain if getattr(model, "instances", None) is not None else model.domain
+)
+
 sido_options = ["서울", "경기", "대구"]
-for attr in model.domain.attributes:
+for attr in base_domain.attributes:
     if attr.is_discrete and "시도" in attr.name:
         sido_options = list(attr.values)
         break
 
-# 화면 2단 분할 (왼쪽: 입력 컨트롤 / 오른쪽: 실시간 예측 결과 & 신호등)
+# 화면 2단 분할
 col_input, col_result = st.columns([1, 1.3], gap="large")
 
 with col_input:
@@ -116,7 +125,7 @@ with col_input:
 # 실시간 예측 계산
 predicted_deaths = predict_fatalities(model, selected_sido, accident_count, minor_injury_count)
 
-# 위험도 단계 판별 (예측 사망자 수 기준)
+# 위험도 단계 판별
 if predicted_deaths < 1.0:
     status_emoji = "🟢"
     status_label = "안전 (SAFE)"
@@ -154,7 +163,6 @@ else:
 with col_result:
     st.subheader("📊 실시간 예측 결과")
 
-    # 메트릭 표시
     m1, m2 = st.columns(2)
     m1.metric(label=f"{selected_sido} 지역 예상 사망자 수", value=f"{predicted_deaths:.2f} 명")
     m2.metric(label="현재 위험 등급", value=f"{status_emoji} {status_label.split()[0]}")
